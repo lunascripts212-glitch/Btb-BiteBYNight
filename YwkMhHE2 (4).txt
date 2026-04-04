@@ -1,0 +1,635 @@
+-- V1perThrow w/ WindUI
+-- Run this as a LocalScript via your executor
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService  = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = workspace.CurrentCamera
+
+local Actors  = require(ReplicatedStorage.Modules.Actors)
+local Network = require(ReplicatedStorage.Modules.Network)
+local Util    = require(ReplicatedStorage.Modules.Util)
+
+-- ════════════════════════════════════════
+--   PLATFORM DETECTION
+-- ════════════════════════════════════════
+
+local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
+-- ════════════════════════════════════════
+--   RUNTIME STATE
+-- ════════════════════════════════════════
+
+local enabled     = false
+local aimbotOn    = false
+local patched     = false
+local crystalCB   = nil
+local unloaded    = false
+
+local AIM_OFFSET     = -0.3
+local AIM_OFFSET_MIN = -5.0
+local AIM_OFFSET_MAX =  5.0
+
+local PREDICTION     = 0.6
+local PREDICTION_MIN = 0.0
+local PREDICTION_MAX = 1.0
+
+local HOLD_DURATION     = 0.9
+local HOLD_DURATION_MIN = 0.3
+local HOLD_DURATION_MAX = 2.0
+
+local killerMotionData = {}
+
+-- ════════════════════════════════════════
+--   CONFIG SYSTEM
+-- ════════════════════════════════════════
+
+local fs = {
+    hasFolder  = isfolder   or function() return false end,
+    makeFolder = makefolder or function() end,
+    write      = writefile  or function() end,
+    hasFile    = isfile     or function() return false end,
+    read       = readfile   or function() return "" end,
+}
+local Config = {}
+do
+    local DIR  = "V1perThrow"
+    local FILE = DIR .. "/config.json"
+    local hs   = game:GetService("HttpService")
+    local function prep()
+        if not fs.hasFolder(DIR) then fs.makeFolder(DIR) end
+    end
+    function Config.load()
+        prep()
+        if not fs.hasFile(FILE) then return end
+        local raw = fs.read(FILE)
+        if not raw or raw == "" then return end
+        local ok, t = pcall(hs.JSONDecode, hs, raw)
+        if ok and type(t) == "table" then
+            for k, v in pairs(t) do Config._data[k] = v end
+        end
+    end
+    function Config.save()
+        prep()
+        local ok, s = pcall(hs.JSONEncode, hs, Config._data)
+        if ok and s and s ~= "" then pcall(fs.write, FILE, s) end
+    end
+    function Config.get(k, default)
+        local v = Config._data[k]
+        if v == nil then return default end
+        return v
+    end
+    function Config.set(k, v) Config._data[k] = v; Config.save() end
+    Config._data = {}
+    Config.load()
+end
+
+enabled       = Config.get("enabled",      false)
+aimbotOn      = Config.get("aimbotOn",     false)
+AIM_OFFSET    = Config.get("aimOffset",    AIM_OFFSET)
+PREDICTION    = Config.get("prediction",   PREDICTION)
+HOLD_DURATION = Config.get("holdDuration", HOLD_DURATION)
+
+-- ════════════════════════════════════════
+--   PC-ONLY HELPERS
+-- ════════════════════════════════════════
+
+local function setShiftLock(on)
+    if isMobile then return end
+    UserInputService.MouseBehavior = on
+        and Enum.MouseBehavior.LockCenter
+        or  Enum.MouseBehavior.Default
+end
+
+local function setMouseBehavior(behavior)
+    if isMobile then return end
+    UserInputService.MouseBehavior = behavior
+end
+
+-- ════════════════════════════════════════
+--   KILLER TRACKING
+-- ════════════════════════════════════════
+
+local function getKillerVelocity(hrp)
+    local now  = tick()
+    local pos  = hrp.Position
+    local data = killerMotionData[hrp]
+    if not data then
+        killerMotionData[hrp] = { lastPos = pos, lastTime = now, velocity = Vector3.zero }
+        return Vector3.zero
+    end
+    local dt = now - data.lastTime
+    if dt <= 0 then return data.velocity end
+    local vel     = (pos - data.lastPos) / dt
+    data.lastPos  = pos
+    data.lastTime = now
+    data.velocity = vel
+    return vel
+end
+
+local function getNearestKiller(fromPos)
+    local folder = workspace:FindFirstChild("Players")
+    folder = folder and folder:FindFirstChild("Killers")
+    if not folder then return nil end
+    local nearest, best = nil, math.huge
+    for _, model in ipairs(folder:GetChildren()) do
+        local hrp = model:FindFirstChild("HumanoidRootPart")
+        local hum = model:FindFirstChildOfClass("Humanoid")
+        if hrp and hum and hum.Health > 0 then
+            local d = (hrp.Position - fromPos).Magnitude
+            if d < best then best = d; nearest = model end
+        end
+    end
+    return nearest
+end
+
+-- ════════════════════════════════════════
+--   PC AIMBOT
+-- ════════════════════════════════════════
+
+local function aimAndFirePC(myHRP, killerHRP, fireCallback, holdDuration, projectileLifetime)
+    local origCamType = Camera.CameraType
+
+    local vp = Camera.ViewportSize
+    pcall(mousemoveabs, vp.X / 2, vp.Y / 2)
+    setMouseBehavior(Enum.MouseBehavior.LockCurrentPosition)
+    Camera.CameraType = Enum.CameraType.Scriptable
+
+    local vel      = getKillerVelocity(killerHRP)
+    local aimPoint = killerHRP.Position + vel * PREDICTION
+    aimPoint = Vector3.new(aimPoint.X, Camera.CFrame.Position.Y + AIM_OFFSET, aimPoint.Z)
+    Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, aimPoint)
+
+    RunService.RenderStepped:Wait()
+    RunService.RenderStepped:Wait()
+
+    setShiftLock(true)
+    fireCallback()
+
+    local startTime         = tick()
+    local shiftLockDisabled = false
+    local smoothVel         = getKillerVelocity(killerHRP)
+
+    local conn
+    conn = RunService.RenderStepped:Connect(function(dt)
+        if not aimbotOn or not myHRP or not myHRP.Parent then
+            conn:Disconnect()
+            Camera.CameraType = origCamType
+            setMouseBehavior(Enum.MouseBehavior.Default)
+            if not shiftLockDisabled then
+                setShiftLock(false)
+                shiftLockDisabled = true
+            end
+            return
+        end
+
+        local elapsed = tick() - startTime
+        local rawVel  = getKillerVelocity(killerHRP)
+        smoothVel     = smoothVel:Lerp(rawVel, math.clamp(dt * 8, 0, 1))
+
+        local ap = killerHRP.Position + smoothVel * PREDICTION
+        ap = Vector3.new(ap.X, Camera.CFrame.Position.Y + AIM_OFFSET, ap.Z)
+        Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, ap)
+
+        if elapsed >= holdDuration then
+            conn:Disconnect()
+            Camera.CameraType = origCamType
+            setMouseBehavior(Enum.MouseBehavior.Default)
+            if not shiftLockDisabled then
+                local remaining = projectileLifetime - elapsed
+                if remaining > 0 then
+                    task.delay(remaining, function()
+                        if not shiftLockDisabled then
+                            setShiftLock(false)
+                            shiftLockDisabled = true
+                        end
+                    end)
+                else
+                    setShiftLock(false)
+                    shiftLockDisabled = true
+                end
+            end
+        end
+    end)
+end
+
+-- ════════════════════════════════════════
+--   MOBILE AIMBOT
+--
+--   HOW MOBILE THROWING ACTUALLY WORKS (from decompiled server source):
+--
+--   Server (sv_OnCrystalFire) gets camera from client via GetCameraCF
+--   remote function, then computes:
+--
+--     target   = HRP.Position + cam.LookVector + cam.UpVector / 3
+--     throwDir = CFrame.lookAt(HRP.Position, target) * CFrame.new(0,0,-500)
+--     spawnPos = HRP.CFrame + Vector3.new(0, (HipHeight + HRP.Size.Y/2)/2, 0)
+--     velocity = (throwDir.Position - spawnPos).Unit * MaxSpeed  -- MaxSpeed=250 at full charge
+--     gravity  = -ProjectileArc  -- = -40
+--
+--   So the actual throw direction ≈ (cam.LookVector + cam.UpVector/3).Unit
+--   The UpVector/3 is an upward bias that makes direct aim always throw too high.
+--
+--   BALLISTIC SOLVER:
+--   Given spawnPos, killerPos, v0=250, g=40 we solve for the required
+--   throw pitch angle θ using the standard discriminant formula.
+--
+--   CAMERA PITCH CORRECTION:
+--   We cannot simply set the camera pitch to θ because of the UpVector/3 offset.
+--   For a camera at pitch α:
+--     LookVector.Y        = sin(α)
+--     UpVector.Y          = cos(α)
+--     (L + U/3).Y / |..| → throw angle θ
+--
+--   Solving for camera pitch α that produces throw pitch θ:
+--     tan(θ) = (sin(α) + cos(α)/3) / (cos(α) - sin(α)/3)
+--     →  tan(α) = (3·tan(θ) − 1) / (3 + tan(θ))
+--     →  α = atan2(3T − 1,  3 + T)   where T = tan(θ)
+--
+--   Verified:
+--     θ=45° → T=1 → α≈26.6° → (L+U/3) gives 45° ✓
+--     θ=0°  → T=0 → α≈−18.4° (cam tilts slightly DOWN to cancel UpVector/3 bias) ✓
+-- ════════════════════════════════════════
+
+local function aimAndFireMobile(myHRP, killerHRP, fireCallback, holdDuration, projectileLifetime, abilityCfg)
+    local origCamType = Camera.CameraType
+    Camera.CameraType = Enum.CameraType.Scriptable
+
+    -- Exact values from Config (confirmed from decompile):
+    --   MaxSpeed     = 250  (throw at full charge, p222=1)
+    --   ProjectileArc = 40  (server uses -ProjectileArc as gravity)
+    local v0 = abilityCfg.MaxSpeed      -- 250
+    local g  = abilityCfg.ProjectileArc -- 40
+
+    -- Spawn offset (matches server formula exactly):
+    --   v238 = (HipHeight + HRP.Size.Y / 2) / 2
+    local hum    = myHRP.Parent and myHRP.Parent:FindFirstChildOfClass("Humanoid")
+    local hipH   = hum and hum.HipHeight or 1.35
+    local v238   = (hipH + myHRP.Size.Y / 2) / 2
+
+    local smoothVel = getKillerVelocity(killerHRP)
+
+    local function buildCamCF(vel)
+        -- Compute projectile spawn pos (matches server exactly)
+        local spawnPos  = myHRP.CFrame.Position + Vector3.new(0, v238, 0)
+
+        -- Predicted killer position with prediction + user offset
+        local predicted = killerHRP.Position + vel * PREDICTION
+        local target    = predicted + Vector3.new(0, AIM_OFFSET, 0)
+
+        -- Flat horizontal direction from spawn to target
+        local delta   = target - spawnPos
+        local flatV   = Vector3.new(delta.X, 0, delta.Z)
+        local dx      = flatV.Magnitude
+        local dy      = delta.Y
+
+        -- Edge case: target directly above/below
+        if dx < 0.01 then
+            local straight = dy >= 0 and Vector3.new(0, 1, 0) or Vector3.new(0, -1, 0)
+            return CFrame.new(Camera.CFrame.Position, Camera.CFrame.Position + straight)
+        end
+
+        local flatDir = flatV.Unit
+
+        -- ── STEP 1: Ballistic solve for desired throw pitch θ ──────────
+        -- Standard projectile equations. At time t:
+        --   horizontal: dx = v0·cos(θ)·t
+        --   vertical:   dy = v0·sin(θ)·t − 0.5·g·t²
+        -- Eliminating t → discriminant form, low-arc solution:
+        local v2   = v0 * v0
+        local v4   = v2 * v2
+        local disc = v4 - g * (g * dx * dx + 2 * dy * v2)
+
+        local theta  -- desired throw pitch (radians, positive = upward)
+        if disc < 0 then
+            -- Target out of ballistic range — aim straight at it (best effort)
+            theta = math.atan2(dy, dx)
+        else
+            -- Low arc (matches the red trajectory arc the game shows)
+            theta = math.atan2(v2 - math.sqrt(disc), g * dx)
+        end
+
+        -- ── STEP 2: Convert θ → camera pitch α ─────────────────────────
+        -- Server formula introduces UpVector/3 bias:
+        --   throwDir ≈ (cam.LookVector + cam.UpVector/3).Unit
+        -- For camera pitch α, this resolves to throw pitch θ where:
+        --   tan(θ) = (sin(α) + cos(α)/3) / (cos(α) − sin(α)/3)
+        -- Solving for α:
+        --   tan(α) = (3·T − 1) / (3 + T)   where T = tan(θ)
+        local T = math.tan(theta)
+        -- Guard against degenerate case (T = -3 → atan2 undefined, near-vertical downward)
+        local denom = 3 + T
+        local alpha
+        if math.abs(denom) < 0.0001 then
+            alpha = -math.pi / 2
+        else
+            alpha = math.atan2(3 * T - 1, denom)
+        end
+
+        -- ── STEP 3: Build camera CFrame ─────────────────────────────────
+        -- Yaw: face horizontally toward the killer
+        local yawCF = CFrame.new(Camera.CFrame.Position,
+                                 Camera.CFrame.Position + flatDir)
+        -- Pitch: apply α around camera's right axis.
+        -- CFrame.Angles(rx, 0, 0) with positive rx tilts LookVector UP.
+        -- α is negative when we need to aim down (e.g. flat shot must cancel
+        -- UpVector/3 bias), so we pass α directly — do NOT negate it.
+        local pitchCF = CFrame.Angles(alpha, 0, 0)
+
+        return yawCF * pitchCF
+    end
+
+    -- Set camera and wait for it to register before the fire event is sent
+    Camera.CFrame = buildCamCF(smoothVel)
+    RunService.RenderStepped:Wait()
+    RunService.RenderStepped:Wait()
+
+    -- Fire the crystal — server will call GetCameraCF here which returns our CFrame
+    fireCallback()
+
+    local startTime = tick()
+
+    -- Hold the corrected camera CFrame so the server's GetCameraCF call
+    -- always gets the right orientation even with network latency
+    local conn
+    conn = RunService.RenderStepped:Connect(function(dt)
+        if not aimbotOn or not myHRP or not myHRP.Parent then
+            conn:Disconnect()
+            Camera.CameraType = origCamType
+            return
+        end
+
+        local rawVel = getKillerVelocity(killerHRP)
+        smoothVel    = smoothVel:Lerp(rawVel, math.clamp(dt * 8, 0, 1))
+        Camera.CFrame = buildCamCF(smoothVel)
+
+        if tick() - startTime >= holdDuration then
+            conn:Disconnect()
+            Camera.CameraType = origCamType
+        end
+    end)
+end
+
+-- ════════════════════════════════════════
+--   DISPATCHER
+-- ════════════════════════════════════════
+
+local function aimAndFire(myHRP, fireCallback, holdDuration, projectileLifetime, abilityCfg)
+    local killer = getNearestKiller(myHRP.Position)
+    if not killer then fireCallback() return end
+
+    local killerHRP = killer:FindFirstChild("HumanoidRootPart")
+    if not killerHRP then fireCallback() return end
+
+    if isMobile then
+        aimAndFireMobile(myHRP, killerHRP, fireCallback, holdDuration, projectileLifetime, abilityCfg)
+    else
+        aimAndFirePC(myHRP, killerHRP, fireCallback, holdDuration, projectileLifetime)
+    end
+end
+
+-- ════════════════════════════════════════
+--   PATCH LOGIC
+-- ════════════════════════════════════════
+
+local function getLocalActor()
+    for _, actor in Actors.CurrentActors do
+        if actor.Player == LocalPlayer then return actor end
+    end
+    return nil
+end
+
+local function applyPatch(actor)
+    if patched or not actor or not actor.Behavior then return end
+    if not actor.Behavior.Abilities or not actor.Behavior.Abilities.Crystal then return end
+
+    crystalCB = actor.Behavior.Abilities.Crystal.Callback
+
+    actor.Behavior.Abilities.Crystal.Callback = function(self, p290)
+        if RunService:IsServer() then return crystalCB(self, p290) end
+        if not enabled then return crystalCB(self, p290) end
+        if p290 == "Cancelled" or not p290 then return crystalCB(self, p290) end
+
+        self.State.IsCrystalEquipped = true
+        Util:ToggleLockForAbilityIcon("Axe", "JaneDoeCrystalEquipped", true)
+
+        task.spawn(function()
+            local abilityCfg = self.Config.Crystal
+            -- Wait for ChannelTime before firing (server enforces this check too)
+            task.wait(abilityCfg.ChannelTime + 0.05)
+
+            if not (self.State.IsCrystalEquipped and enabled) then return end
+
+            -- Patch always fires at 100% charge (sends 1) → uses MaxSpeed = 250
+            local function doFire()
+                Network:FireServerConnection(
+                    ("%sCrystalInput"):format(self.Player.Name),
+                    "REMOTE_EVENT",
+                    1
+                )
+            end
+
+            if aimbotOn then
+                local myHRP = self.Rig and self.Rig:FindFirstChild("HumanoidRootPart")
+                if myHRP then
+                    aimAndFire(myHRP, doFire, HOLD_DURATION, abilityCfg.ProjectileLifetime, abilityCfg)
+                else
+                    doFire()
+                end
+            else
+                doFire()
+            end
+        end)
+    end
+
+    patched = true
+    print("[V1perThrow] Patched successfully.")
+end
+
+local function removePatch(actor)
+    if not patched or not actor then return end
+    if not actor.Behavior or not actor.Behavior.Abilities then return end
+    if not actor.Behavior.Abilities.Crystal then return end
+    if crystalCB then
+        actor.Behavior.Abilities.Crystal.Callback = crystalCB
+        crystalCB = nil
+    end
+    patched = false
+    print("[V1perThrow] Patch removed.")
+end
+
+-- ════════════════════════════════════════
+--   WINDUI
+-- ════════════════════════════════════════
+
+local WindUI = loadstring(game:HttpGet(
+    "https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"
+))()
+
+local Window = WindUI:CreateWindow({
+    Title  = "V1perThrow",
+    Icon   = "gem",
+    Author = "V1perThrow",
+    Folder = "V1perThrow",
+    Theme  = "Dark",
+})
+
+if not isMobile then
+    Window:SetToggleKey(Enum.KeyCode.K)
+end
+
+local Tab = Window:Tab({ Title = "Main", Icon = "crosshair" })
+
+local StatusParagraph = Tab:Paragraph({
+    Title   = "Status",
+    Content = "Waiting for actor...",
+})
+
+local function setStatus(text)
+    StatusParagraph:SetDesc(text)
+end
+
+Tab:Paragraph({
+    Title   = "Platform",
+    Content = isMobile
+        and "Mobile — ballistic arc solver active (UpVector/3 corrected)"
+        or  "PC — mouse aim active, press K to toggle UI",
+})
+
+Tab:Toggle({
+    Title = "Enable Patch",
+    Desc  = "Auto-fire the Crystal ability when equipped",
+    Icon  = "zap",
+    Value = enabled,
+    Callback = function(state)
+        if unloaded then return end
+        enabled = state
+        Config.set("enabled", state)
+        local actor = getLocalActor()
+        if enabled and not patched and actor then applyPatch(actor) end
+        setStatus(enabled and "Active" or "Inactive")
+    end,
+})
+
+Tab:Toggle({
+    Title = "Aimbot",
+    Desc  = "Auto-aim at the nearest killer when firing",
+    Icon  = "target",
+    Value = aimbotOn,
+    Callback = function(state)
+        if unloaded then return end
+        aimbotOn = state
+        Config.set("aimbotOn", state)
+        if not aimbotOn then
+            killerMotionData = {}
+            setShiftLock(false)
+            setMouseBehavior(Enum.MouseBehavior.Default)
+        end
+        local actor = getLocalActor()
+        if aimbotOn and not patched and actor then applyPatch(actor) end
+    end,
+})
+
+Tab:Divider()
+
+Tab:Slider({
+    Title = "Aim Offset",
+    Desc  = "Y adjustment on the aim target — 0 = killer's centre",
+    Step  = 0.1,
+    Value = { Min = AIM_OFFSET_MIN, Max = AIM_OFFSET_MAX, Default = AIM_OFFSET },
+    Callback = function(v) AIM_OFFSET = v; Config.set("aimOffset", v) end,
+})
+
+Tab:Slider({
+    Title = "Prediction",
+    Desc  = "Seconds to lead the killer's movement (0 = no lead)",
+    Step  = 0.01,
+    Value = { Min = PREDICTION_MIN, Max = PREDICTION_MAX, Default = PREDICTION },
+    Callback = function(v) PREDICTION = v; Config.set("prediction", v) end,
+})
+
+Tab:Slider({
+    Title = "Hold Duration",
+    Desc  = "Seconds to hold aim after the shot fires",
+    Step  = 0.1,
+    Value = { Min = HOLD_DURATION_MIN, Max = HOLD_DURATION_MAX, Default = HOLD_DURATION },
+    Callback = function(v) HOLD_DURATION = v; Config.set("holdDuration", v) end,
+})
+
+Tab:Divider()
+
+local SettingsTab = Window:Tab({ Title = "Settings", Icon = "settings" })
+
+SettingsTab:Button({
+    Title = "Unload Script",
+    Desc  = "Remove the patch and close this window",
+    Icon  = "power",
+    Callback = function()
+        if unloaded then return end
+        unloaded = true
+        enabled  = false
+        aimbotOn = false
+
+        setShiftLock(false)
+        setMouseBehavior(Enum.MouseBehavior.Default)
+        pcall(function() removePatch(getLocalActor()) end)
+
+        WindUI:Notify({
+            Title    = "V1perThrow",
+            Content  = "Script unloaded successfully.",
+            Icon     = "check",
+            Duration = 3,
+        })
+
+        task.delay(0.5, function() Window:Destroy() end)
+        print("[V1perThrow] Unloaded.")
+    end,
+})
+
+-- ════════════════════════════════════════
+--   ACTOR WATCHER
+-- ════════════════════════════════════════
+
+task.spawn(function()
+    setStatus("Waiting for actor...")
+    local lastActor = nil
+
+    while not unloaded do
+        task.wait(0.5)
+        if unloaded then break end
+
+        local currentActor = getLocalActor()
+
+        if currentActor ~= lastActor then
+            if lastActor ~= nil then
+                patched          = false
+                crystalCB        = nil
+                killerMotionData = {}
+                print("[V1perThrow] New round — resetting patch.")
+                WindUI:Notify({
+                    Title    = "V1perThrow",
+                    Content  = "New round — patch re-applied.",
+                    Icon     = "refresh-cw",
+                    Duration = 3,
+                })
+            end
+
+            lastActor = currentActor
+
+            if currentActor then
+                if enabled then
+                    applyPatch(currentActor)
+                    setStatus("Active")
+                else
+                    setStatus("Ready — toggle to activate")
+                end
+                print("[V1perThrow] Actor found. Ready.")
+            else
+                setStatus("Waiting for actor...")
+            end
+        end
+    end
+end)
