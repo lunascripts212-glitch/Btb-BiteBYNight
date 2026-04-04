@@ -1384,11 +1384,6 @@ end
 ------------------------------------------------------------------------
 local secSentinels = tabSurSen:Section({ Title = "Sentinels", Opened = true })
 
--- Guest1337
-secSentinels:Button({ Title="Guest1337", Locked=true, Callback=function() end })
-
--- Shedletsky
-secSentinels:Button({ Title="Shedletsky (just use hitbox lol)", Locked=true, Callback=function() end })
 
 -- ──────────────────────────────────────────────
 -- CHANCE AIMBOT (inline)
@@ -1559,10 +1554,6 @@ do
     end })
     chanceSection:Toggle({ Title="Custom Shoot Anim", Value=false, Callback=function(v) chanceCustomAnim=v end })
     chanceSection:Input({ Title="Animation ID", Callback=function(v) chanceCustomAnimID=v end })
-
-    secSentinels:Button({ Title="Chance", Callback=function()
-        ui:Notify({ Title="Chance Aimbot", Content="Use the Chance Aimbot section above!", Duration=3, Icon="info" })
-    end })
 end
 
 -- ──────────────────────────────────────────────
@@ -1738,18 +1729,7 @@ do
     bsSection:Slider({ Title="Behind Distance", Step=0.5, Value={Min=0.5,Max=10,Default=BS_BEHIND_DISTANCE}, Callback=function(v) BS_BEHIND_DISTANCE=v end })
     bsSection:Slider({ Title="Remote Fire Delay (s)", Step=0.01, Value={Min=0.00,Max=0.50,Default=BS_REMOTE_FIRE_DELAY}, Callback=function(v) BS_REMOTE_FIRE_DELAY=v end })
     bsSection:Slider({ Title="Aim Snap Delay (s)", Step=0.01, Value={Min=0.00,Max=0.25,Default=BS_AIM_SNAP_DELAY}, Callback=function(v) BS_AIM_SNAP_DELAY=v end })
-
-    secSentinels:Button({ Title="TwoTime", Callback=function()
-        ui:Notify({ Title="TwoTime", Content="Use the TwoTime Backstab section above!", Duration=3, Icon="info" })
-    end })
 end
-
--- Supports section
-local secSupports = tabSurSen:Section({ Title = "Supports", Opened = false })
-secSupports:Button({ Title="Dusekkar", Locked=true, Callback=function() end })
-secSupports:Button({ Title="Elliot", Callback=function()
-    ui:Notify({ Title="Elliot", Content="Use the Elliot Aimbot section above!", Duration=3, Icon="info" })
-end })
 
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
